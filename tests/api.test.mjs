@@ -16,7 +16,7 @@ async function request(path,method='GET',data, cookie) {
 }
 before(async()=>{
   dir=await mkdtemp(join(tmpdir(),'moneycheck-test-'));
-  child=spawn(process.execPath,['server.mjs'],{cwd:new URL('..',import.meta.url),env:{...process.env,PORT:String(port),APP_URL:base,DATABASE_PATH:join(dir,'test.sqlite'),RESEND_API_KEY:'',MAIL_FROM:''},stdio:['ignore','pipe','pipe']});
+  child=spawn(process.execPath,['server.mjs'],{cwd:new URL('..',import.meta.url),env:{...process.env,PORT:String(port),APP_URL:base,DATABASE_PATH:join(dir,'test.sqlite'),RESEND_API_KEY:'',MAIL_FROM:'',CRON_SECRET:'test-cron-only',DATABASE_URL:'',POSTGRES_URL:'',VERCEL:''},stdio:['ignore','pipe','pipe']});
   await new Promise((resolve,reject)=>{let log='';const timeout=setTimeout(()=>reject(new Error('서버 시작 시간 초과 '+log)),10000); child.stdout.on('data',b=>{log+=b;if(log.includes('머니체크 실행')){clearTimeout(timeout);resolve();}}); child.once('error',reject);child.once('exit',code=>{clearTimeout(timeout);reject(new Error('서버 종료 '+code+' '+log));});});
   db=new DatabaseSync(join(dir,'test.sqlite'));
 });
@@ -101,4 +101,9 @@ test('교차 사이트 요청과 비공개 파일 접근을 거부한다',async(
   assert.equal((await fetch(base+'/data/moneycheck.sqlite')).status,404);
   assert.equal((await fetch(base+'/server.mjs')).status,404);
   assert.equal((await fetch(base+'/')).status,200);
+});
+test('예약 기록은 유효한 서버 비밀 값으로만 호출할 수 있다',async()=>{
+  assert.equal((await request('cron')).status,401);
+  const r=await fetch(base+'/api/cron',{headers:{Authorization:'Bearer test-cron-only'}});
+  assert.equal(r.status,200);assert.equal((await r.json()).processed,2);
 });
