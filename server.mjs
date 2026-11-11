@@ -6,6 +6,7 @@ import { randomBytes, randomUUID, scryptSync, timingSafeEqual, createHash } from
 import { sqlRepository } from './lib/sql-repository.mjs';
 import { defaults } from './lib/categories.mjs';
 import { parseCardSms } from './lib/card-sms.mjs';
+import { monthlyExpenses } from './lib/reports.mjs';
 import { today, validDate, billDate, nextMonth, occurrences } from './lib/billing.mjs';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
@@ -250,7 +251,9 @@ async function api(req, res, url) {
   if (path === '/api/data' && method === 'GET') {
     const year = today().slice(0,4);
     const warnings = await sync(user.id);
-    return { user, year, today:today(), warnings, cardCompanies:await db.cardCompanies(user.id), transactions:(await db.transactions(user.id,year)).map(t=>({...t,category:t.category==='구독'?'고정지출':t.category})), subscriptions:await Promise.all((await db.subscriptions(user.id)).map(upcoming)), categories:(await db.categories(user.id)).map(c=>({...c,name:c.name==='구독'?'고정지출':c.name})).filter((c,i,a)=>a.findIndex(v=>v.type===c.type&&v.name===c.name)===i) };
+    const transactions = await db.transactions(user.id,year);
+    const previous = await db.transactions(user.id,String(Number(year)-1));
+    return { user, year, today:today(), warnings, monthlyExpenses:monthlyExpenses([...previous,...transactions]), cardCompanies:await db.cardCompanies(user.id), transactions:transactions.map(t=>({...t,category:t.category==='구독'?'고정지출':t.category})), subscriptions:await Promise.all((await db.subscriptions(user.id)).map(upcoming)), categories:(await db.categories(user.id)).map(c=>({...c,name:c.name==='구독'?'고정지출':c.name})).filter((c,i,a)=>a.findIndex(v=>v.type===c.type&&v.name===c.name)===i) };
   }
   if (path === '/api/card-companies' && method === 'POST') {
     const b=await body(req);await db.addCardCompany(user.id,text(b.name,40));return {ok:true};
