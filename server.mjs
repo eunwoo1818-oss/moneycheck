@@ -141,7 +141,10 @@ async function api(req, res, url) {
     if (origin && origin !== appUrl && origin !== `http://127.0.0.1:${port}`) fail('허용되지 않은 요청입니다.', 403);
     if (req.headers['sec-fetch-site'] === 'cross-site') fail('허용되지 않은 요청입니다.', 403);
   }
-  if (path === '/api/status' && method === 'GET') return { setup: !(await db.hasUsers()), emailConfigured: !!(process.env.RESEND_API_KEY && process.env.MAIL_FROM) };
+  if (path === '/api/status' && method === 'GET') {
+    const setup = !await db.hasUsers();
+    return { setup, setupCodeRequired: setup && !!process.env.VERCEL, emailConfigured: !!(process.env.RESEND_API_KEY && process.env.MAIL_FROM) };
+  }
   if (path === '/api/register' && method === 'POST') {
     await rateLimit(req, 'register', 10);
     const b = await body(req), mail = email(b.email), pass = password(b.password);
@@ -149,8 +152,10 @@ async function api(req, res, url) {
     const name = first ? 'JE.KIM' : text(b.name, 40), id = randomUUID();
     if ((await db.findUserByEmail(mail))) fail('이 이메일로 계정을 만들 수 없습니다.');
     if (first && process.env.VERCEL) {
-      if (!process.env.ADMIN_EMAIL) fail('관리자 계정 설정이 필요합니다.', 503);
+      const setupCode = process.env.ADMIN_SETUP_CODE;
+      if (!process.env.ADMIN_EMAIL || !setupCode) fail('관리자 계정 설정이 필요합니다.', 503);
       if (mail !== process.env.ADMIN_EMAIL.trim().toLowerCase()) fail('첫 계정은 지정된 관리자 이메일로 만들어 주세요.',403);
+      if (typeof b.setupCode!=='string' || !timingSafeEqual(Buffer.from(hash(b.setupCode.trim()),'hex'),Buffer.from(hash(setupCode),'hex'))) fail('관리자 설정 코드를 확인해 주세요.',403);
     }
     const categories = Object.entries(defaults).flatMap(([type,names])=>names.map(name=>({type,name})));
     categories.push({type:'expense',name:'구독'});

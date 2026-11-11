@@ -24,7 +24,7 @@ Firebase 프로젝트에 기본 Standard 데이터베이스를 만들고 `fireba
 2. 연결 대상에 `moneycheck`의 Production을 포함한다. `DATABASE_URL` 또는 `POSTGRES_URL`이 해당 프로젝트의 Production 환경 변수에 제공되어야 한다.
 3. `APP_URL=https://moneycheck-ivory.vercel.app`, `ADMIN_EMAIL`(소유자가 사용할 이메일), `CRON_SECRET`(고엔트로피 임의 값)을 Production에 설정한다. 비밀 값은 저장소에 넣지 않는다.
 4. `main`의 최신 커밋으로 재배포한다. 데이터베이스 설정을 추가한 뒤에는 재배포가 필요하다.
-5. `/api/status`가 200을 반환하는지 확인한다. 첫 계정은 `ADMIN_EMAIL`로만 만들 수 있으며 이름은 JE.KIM이다.
+5. `/api/status`가 200을 반환하는지 확인한다. 첫 계정은 `ADMIN_EMAIL`과 `ADMIN_SETUP_CODE`로 만들 수 있으며 이름은 JE.KIM이다. 설정 코드는 운영 환경의 민감한 환경 변수로 관리하고 관리자 본인에게만 전달한다.
 
 Neon 이외의 PostgreSQL도 `pg` 드라이버와 호환되는 연결 문자열을 제공하면 사용할 수 있다. 연결 인증서 검증은 드라이버 기본 설정을 유지하며, 검증을 끄는 옵션을 사용하지 않는다.
 
