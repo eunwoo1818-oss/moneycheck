@@ -4,5 +4,8 @@ data/
 !.env.example
 node_modules/
 .vercel/
+firebase-debug.log
+firestore-debug.log
+.firebase/
 *.sqlite*
 test-results/

@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { resolve, extname } from 'node:path';
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
+import { sqlRepository } from './lib/sql-repository.mjs';
 import { defaults } from './lib/categories.mjs';
 import { today, validDate, billDate, nextMonth, occurrences } from './lib/billing.mjs';
 
@@ -13,13 +14,16 @@ async function ensureStore() {
   if (db) return;
   if (!storePromise) storePromise = (async () => {
     const connection = process.env.DATABASE_URL || process.env.POSTGRES_URL;
-    if (connection) {
+    if (process.env.FIREBASE_PROJECT_ID) {
+      const { openFirebaseStore } = await import('./lib/firebase-store.mjs');
+      db = openFirebaseStore();
+    } else if (connection) {
       const { openPostgresStore } = await import('./lib/postgres-store.mjs');
-      db = await openPostgresStore(connection);
+      db = sqlRepository(await openPostgresStore(connection));
     } else {
       if (process.env.VERCEL) fail('서비스 준비 중입니다. 영구 데이터 저장소 연결이 필요합니다.', 503);
       const { openStore } = await import('./lib/store.mjs');
-      db = openStore(process.env.DATABASE_PATH || resolve(root, 'data/moneycheck.sqlite'));
+      db = sqlRepository(openStore(process.env.DATABASE_PATH || resolve(root, 'data/moneycheck.sqlite')));
     }
   })();
   try { await storePromise; } catch (error) { storePromise = null; throw error; }
@@ -37,15 +41,17 @@ const password = value => typeof value === 'string' && value.length >= 10 && val
 const email = value => { const v = text(value, 254).toLowerCase(); return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) ? v : fail('이메일 주소를 확인해 주세요.'); };
 const amount = (value, currency = 'KRW') => typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 1e12 && (currency !== 'KRW' || Number.isInteger(value)) && Math.abs(value * 100 - Math.round(value * 100)) < 0.001 ? value : fail('금액을 확인해 주세요. 원화는 정수로 입력하세요.');
 const date = value => validDate(value) ? value : fail('날짜를 확인해 주세요.');
+function ledgerDate(value) {
+  const day = date(value);
+  if (day.slice(0,4)!==today().slice(0,4)) fail('올해 장부의 날짜만 입력할 수 있습니다.');
+  return day;
+}
 const type = value => ['income', 'expense'].includes(value) ? value : fail('수입 또는 지출을 선택해 주세요.');
 async function rateLimit(req, key, max = 20) {
   const now = Date.now();
   const ip = process.env.VERCEL ? String(req.headers['x-forwarded-for'] || req.socket.remoteAddress).split(',')[0] : req.socket.remoteAddress;
   const k = hash(`${ip}:${key}`);
-  await db.prepare('DELETE FROM rate_limits WHERE expires<?').run(now);
-  const entry = await db.prepare(`INSERT INTO rate_limits(key,count,expires) VALUES (?,1,?)
-    ON CONFLICT(key) DO UPDATE SET count=rate_limits.count+1 RETURNING count`).get(k,now+15*60000);
-  if (entry.count > max) fail('요청이 많습니다. 15분 후 다시 시도해 주세요.', 429);
+  if (await db.rateLimit(k,now) > max) fail('요청이 많습니다. 15분 후 다시 시도해 주세요.', 429);
 }
 async function body(req) {
   if (!(req.headers['content-type'] || '').startsWith('application/json')) fail('지원하지 않는 요청 형식입니다.', 415);
@@ -63,39 +69,34 @@ async function body(req) {
 async function auth(req) {
   const token = /(?:^|;\s*)moneycheck=([a-f0-9]{64})(?:;|$)/.exec(req.headers.cookie || '')?.[1];
   if (!token) return null;
-  return (await db.prepare('SELECT u.id,u.email,u.name,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires>? AND u.disabled=0').get(hash(token), Date.now()));
+  return (await db.sessionUser(hash(token),Date.now()));
 }
 async function session(res, id) {
   const token = randomBytes(32).toString('hex');
-  await db.batch([
-    {sql:'UPDATE users SET name=name WHERE id=?',args:[id]},
-    {sql:'DELETE FROM sessions WHERE user_id=? OR expires<?',args:[id,Date.now()]},
-    {sql:'INSERT INTO sessions VALUES (?,?,?)',args:[hash(token),id,Date.now()+7*86400000]},
-  ]);
+  await db.createSession(id,hash(token),Date.now()+7*86400000,Date.now());
   res.setHeader('Set-Cookie', `moneycheck=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800${process.env.COOKIE_SECURE === '1' || process.env.VERCEL ? '; Secure' : ''}`);
 }
 async function getRate(day) {
-  const cached = (await db.prepare('SELECT rate,rate_date FROM exchange_rates WHERE date=?').get(day));
+  const cached = (await db.exchangeRate(day));
   if (cached) return cached;
   const response = await fetch(`https://api.frankfurter.dev/v2/rate/USD/KRW?date=${day}`, { signal: AbortSignal.timeout(6000) });
   if (!response.ok) throw new Error('환율 조회 실패');
   const r = await response.json();
   if (!r || r.base !== 'USD' || r.quote !== 'KRW' || !(r.rate > 0) || !validDate(r.date) || r.date > day) throw new Error('환율 데이터 오류');
-  (await db.prepare('INSERT OR IGNORE INTO exchange_rates VALUES (?,?,?)').run(day, r.rate, r.date));
+  (await db.saveExchangeRate(day,r.rate,r.date));
   return { rate: r.rate, rate_date: r.date };
 }
 async function sync(userId) {
   const warnings = [];
-  for (const s of (await db.prepare('SELECT * FROM subscriptions WHERE user_id=? AND active=1').all(userId))) {
-    const recorded = new Set((await db.prepare('SELECT billing_month FROM transactions WHERE subscription_id=? AND user_id=?').all(s.id,userId)).map(t=>t.billing_month));
+  for (const s of (await db.subscriptions(userId))) {
+    const recorded = new Set((await db.billingMonths(userId,s.id)).map(t=>t.billing_month));
     for (const bill of occurrences(s, today())) {
-      if (recorded.has(bill.month)) continue;
+      if (bill.date.slice(0,4)!==today().slice(0,4) || recorded.has(bill.month)) continue;
       let fx = { rate: 1, rate_date: bill.date };
       if (s.currency === 'USD') {
         try { fx = await getRate(bill.date); } catch { warnings.push(`${s.name}: ${bill.date} 환율을 확인할 수 없어 자동 기록을 보류했습니다.`); break; }
       }
-      (await db.prepare(`INSERT OR IGNORE INTO transactions (id,user_id,type,amount,date,category,memo,subscription_id,billing_month,original_amount,currency,rate,rate_date) VALUES (?,?,'expense',?,?,'구독',?,?,?,?,?,?,?)`)
-        .run(randomUUID(), userId, Math.max(1, Math.round(s.amount * fx.rate)), bill.date, s.name, s.id, bill.month, s.amount, s.currency, fx.rate, fx.rate_date));
+      (await db.createTransaction({id:randomUUID(),user_id:userId,type:'expense',amount:Math.max(1,Math.round(s.amount*fx.rate)),date:bill.date,category:'구독',memo:s.name,subscription_id:s.id,billing_month:bill.month,original_amount:s.amount,currency:s.currency,rate:fx.rate,rate_date:fx.rate_date},true));
     }
   }
   return warnings;
@@ -114,11 +115,11 @@ function subscriptionData(b) {
   return [text(b.name), amount(b.amount, currency), currency, day, month];
 }
 async function upcoming(s) {
-  const recorded = new Set((await db.prepare('SELECT billing_month FROM transactions WHERE subscription_id=? AND user_id=?').all(s.id,s.user_id)).map(t=>t.billing_month));
+  const recorded = new Set((await db.billingMonths(s.user_id,s.id)).map(t=>t.billing_month));
   let month = s.start_month;
   for (let i=0;i<1300;i++) {
     const d = billDate(month, s.original_day);
-    if (!recorded.has(month)) return { ...s, next_date: d, next_month: month };
+    if (d.slice(0,4)>=today().slice(0,4) && !recorded.has(month)) return { ...s, next_date: d, next_month: month };
     month = nextMonth(month);
   }
   return s;
@@ -128,7 +129,7 @@ async function api(req, res, url) {
     const secret = process.env.CRON_SECRET;
     if (!secret || !timingSafeEqual(Buffer.from(hash(req.headers.authorization || ''),'hex'),Buffer.from(hash(`Bearer ${secret}`),'hex'))) fail('권한이 없습니다.',401);
     await ensureStore();
-    const users = await db.prepare('SELECT id FROM users WHERE disabled=0').all();
+    const users = await db.activeUsers();
     let processed = 0, pending = 0;
     for (const u of users) { pending += (await sync(u.id)).length; processed++; }
     return {ok:true,processed,pending};
@@ -140,21 +141,20 @@ async function api(req, res, url) {
     if (origin && origin !== appUrl && origin !== `http://127.0.0.1:${port}`) fail('허용되지 않은 요청입니다.', 403);
     if (req.headers['sec-fetch-site'] === 'cross-site') fail('허용되지 않은 요청입니다.', 403);
   }
-  if (path === '/api/status' && method === 'GET') return { setup: !(await db.prepare('SELECT id FROM users LIMIT 1').get()), emailConfigured: !!(process.env.RESEND_API_KEY && process.env.MAIL_FROM) };
+  if (path === '/api/status' && method === 'GET') return { setup: !(await db.hasUsers()), emailConfigured: !!(process.env.RESEND_API_KEY && process.env.MAIL_FROM) };
   if (path === '/api/register' && method === 'POST') {
     await rateLimit(req, 'register', 10);
     const b = await body(req), mail = email(b.email), pass = password(b.password);
-    const first = !(await db.prepare('SELECT id FROM users LIMIT 1').get());
+    const first = !(await db.hasUsers());
     const name = first ? 'JE.KIM' : text(b.name, 40), id = randomUUID();
-    if ((await db.prepare('SELECT id FROM users WHERE email=?').get(mail))) fail('이 이메일로 계정을 만들 수 없습니다.');
+    if ((await db.findUserByEmail(mail))) fail('이 이메일로 계정을 만들 수 없습니다.');
     if (first && process.env.VERCEL) {
       if (!process.env.ADMIN_EMAIL) fail('관리자 계정 설정이 필요합니다.', 503);
       if (mail !== process.env.ADMIN_EMAIL.trim().toLowerCase()) fail('첫 계정은 지정된 관리자 이메일로 만들어 주세요.',403);
     }
-    const statements = [{sql:'INSERT INTO users(id,email,name,password,role) VALUES (?,?,?,?,?)',args:[id,mail,name,digest(pass),first?'admin':'user']}];
-    for (const [t,names] of Object.entries(defaults)) for (const n of names) statements.push({sql:'INSERT INTO categories VALUES (?,?,?)',args:[id,t,n]});
-    statements.push({sql:"INSERT INTO categories VALUES (?,'expense','구독')",args:[id]});
-    try { await db.batch(statements); } catch(error) {
+    const categories = Object.entries(defaults).flatMap(([type,names])=>names.map(name=>({type,name})));
+    categories.push({type:'expense',name:'구독'});
+    try { await db.createUser({id,email:mail,name,password:digest(pass),role:first?'admin':'user'},categories); } catch(error) {
       if (['23505','ERR_SQLITE_ERROR'].includes(error.code)) fail('계정을 만들 수 없습니다. 이미 등록되었는지 확인해 주세요.',409);
       throw error;
     }
@@ -163,7 +163,7 @@ async function api(req, res, url) {
   if (path === '/api/login' && method === 'POST') {
     await rateLimit(req,'login');
     const b = await body(req), mail = email(b.email), pass = password(b.password);
-    const u = (await db.prepare('SELECT * FROM users WHERE email=?').get(mail));
+    const u = (await db.findUserByEmail(mail));
     const matches = verify(pass, u?.password || dummyPassword);
     if (!u || !matches || u.disabled) fail('이메일 또는 비밀번호를 확인해 주세요.',401);
     await session(res,u.id); return { ok: true };
@@ -172,15 +172,14 @@ async function api(req, res, url) {
     await rateLimit(req,'forgot',5);
     const b = await body(req), mail = email(b.email);
     if (!process.env.RESEND_API_KEY || !process.env.MAIL_FROM) fail('이메일 발송 서비스가 아직 연결되지 않았습니다. 서버 설정이 필요합니다.',503);
-    const u = (await db.prepare('SELECT id FROM users WHERE email=? AND disabled=0').get(mail));
-    if (u) {
+    const u = (await db.findUserByEmail(mail));
+    if (u && !u.disabled) {
       const token = randomBytes(32).toString('hex');
-      (await db.prepare('DELETE FROM resets WHERE user_id=? OR expires<?').run(u.id,Date.now()));
-      (await db.prepare('INSERT INTO resets VALUES (?,?,?)').run(hash(token),u.id,Date.now()+30*60000));
+      await db.createReset(hash(token),u.id,Date.now()+30*60000,Date.now());
       try {
         const r = await fetch('https://api.resend.com/emails',{ method:'POST', signal:AbortSignal.timeout(10000), headers:{ Authorization:`Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type':'application/json' }, body:JSON.stringify({from:process.env.MAIL_FROM,to:[mail],subject:'머니체크 비밀번호 재설정',text:`다음 링크에서 30분 이내에 비밀번호를 재설정하세요.\n${appUrl}/?reset=${token}\n요청하지 않았다면 이 이메일을 무시하세요.`}) });
         if (!r.ok) throw new Error('mail');
-      } catch { (await db.prepare('DELETE FROM resets WHERE token=?').run(hash(token))); fail('이메일 전송을 완료하지 못했습니다. 잠시 후 다시 시도해 주세요.',503); }
+      } catch { (await db.deleteReset(hash(token))); fail('이메일 전송을 완료하지 못했습니다. 잠시 후 다시 시도해 주세요.',503); }
     }
     return { message:'가입된 이메일이라면 재설정 링크를 보냈습니다.' };
   }
@@ -192,54 +191,71 @@ async function api(req, res, url) {
   }
   const user = await auth(req);
   if (!user) fail('로그인이 필요합니다.',401);
+  if (path === '/api/export' && method === 'GET') {
+    const year = url.searchParams.get('year') || today().slice(0,4);
+    if (!/^\d{4}$/.test(year) || Number(year)<2000 || year>today().slice(0,4)) fail('저장할 연도를 확인해 주세요.');
+    if (year===today().slice(0,4)) await sync(user.id);
+    const rows = await db.transactions(user.id,year);
+    const columns = ['날짜','구분','카테고리','금액(원)','메모','청구 월','원래 금액','통화','적용 환율','환율 기준일'];
+    const cell = value => {
+      let text = String(value ?? '');
+      if (typeof value === 'string' && /^[\s]*[=+\-@]/.test(text)) text = "'" + text;
+      return '"' + text.replaceAll('"','""') + '"';
+    };
+    const lines = [columns,...rows.map(t=>[t.date,t.type==='income'?'수입':'지출',t.category,t.amount,t.memo,t.billing_month,t.original_amount,t.currency,t.rate,t.rate_date])];
+    res.writeHead(200,{'Content-Type':'text/csv; charset=utf-8','Content-Disposition':`attachment; filename="moneycheck-${year}.csv"`});
+    res.end('\uFEFF'+lines.map(line=>line.map(cell).join(',')).join('\r\n')+'\r\n');
+    return;
+  }
   if (path === '/api/logout' && method === 'POST') {
-    await body(req); (await db.prepare('DELETE FROM sessions WHERE user_id=?').run(user.id));
+    await body(req); (await db.deleteSessions(user.id));
     res.setHeader('Set-Cookie','moneycheck=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'); return { ok:true };
   }
   if (path === '/api/data' && method === 'GET') {
+    const year = today().slice(0,4);
     const warnings = await sync(user.id);
-    return { user, today:today(), warnings, transactions:(await db.prepare('SELECT * FROM transactions WHERE user_id=? AND deleted=0 ORDER BY date DESC,id').all(user.id)), subscriptions:await Promise.all((await db.prepare('SELECT * FROM subscriptions WHERE user_id=? AND active=1').all(user.id)).map(upcoming)), categories:(await db.prepare('SELECT type,name FROM categories WHERE user_id=? ORDER BY type,name').all(user.id)) };
+    return { user, year, today:today(), warnings, transactions:(await db.transactions(user.id,year)), subscriptions:await Promise.all((await db.subscriptions(user.id)).map(upcoming)), categories:(await db.categories(user.id)) };
   }
   if (path === '/api/categories' && method === 'POST') {
-    const b = await body(req); (await db.prepare('INSERT OR IGNORE INTO categories VALUES (?,?,?)').run(user.id,type(b.type),text(b.name,30))); return { ok:true };
+    const b = await body(req); (await db.addCategory(user.id,type(b.type),text(b.name,30))); return { ok:true };
   }
   if (path === '/api/transactions' && method === 'POST') {
     const b = await body(req), t = type(b.type), c = text(b.category,30);
-    if (!(await db.prepare('SELECT name FROM categories WHERE user_id=? AND type=? AND name=?').get(user.id,t,c))) fail('카테고리를 먼저 추가해 주세요.');
-    (await db.prepare('INSERT INTO transactions(id,user_id,type,amount,date,category,memo) VALUES (?,?,?,?,?,?,?)').run(randomUUID(),user.id,t,amount(b.amount),date(b.date),c,typeof b.memo === 'string' && b.memo.length<=500 ? b.memo : '')); return { ok:true };
+    if (!(await db.hasCategory(user.id,t,c))) fail('카테고리를 먼저 추가해 주세요.');
+    (await db.createTransaction({id:randomUUID(),user_id:user.id,type:t,amount:amount(b.amount),date:ledgerDate(b.date),category:c,memo:typeof b.memo==='string'&&b.memo.length<=500?b.memo:''})); return { ok:true };
   }
   const tx = /^\/api\/transactions\/([\w-]+)$/.exec(path);
   if (tx && ['PATCH','DELETE'].includes(method)) {
-    const row = (await db.prepare('SELECT * FROM transactions WHERE id=? AND user_id=? AND deleted=0').get(tx[1],user.id));
-    if (!row) fail('내역을 찾을 수 없습니다.',404);
-    if (method === 'DELETE') { await body(req); (await db.prepare('UPDATE transactions SET deleted=1 WHERE id=? AND user_id=?').run(row.id,user.id)); }
+    const row = (await db.transaction(user.id,tx[1]));
+    if (!row || row.date.slice(0,4)!==today().slice(0,4)) fail('내역을 찾을 수 없습니다.',404);
+    if (method === 'DELETE') { await body(req); (await db.deleteTransaction(user.id,row.id)); }
     else {
       const b = await body(req), t = row.subscription_id ? 'expense' : type(b.type), c = text(b.category,30);
-      if (!(await db.prepare('SELECT name FROM categories WHERE user_id=? AND type=? AND name=?').get(user.id,t,c))) fail('카테고리를 확인해 주세요.');
-      (await db.prepare('UPDATE transactions SET type=?,amount=?,date=?,category=?,memo=? WHERE id=? AND user_id=?').run(t,amount(b.amount),date(b.date),c,typeof b.memo==='string' && b.memo.length<=500?b.memo:'',row.id,user.id));
+      if (!(await db.hasCategory(user.id,t,c))) fail('카테고리를 확인해 주세요.');
+      (await db.updateTransaction(user.id,row.id,{type:t,amount:amount(b.amount),date:ledgerDate(b.date),category:c,memo:typeof b.memo==='string'&&b.memo.length<=500?b.memo:''}));
     }
     return { ok:true };
   }
   if (path === '/api/subscriptions' && method === 'POST') {
-    const b = await body(req), values = subscriptionData(b);
-    (await db.prepare('INSERT INTO subscriptions(id,user_id,name,amount,currency,original_day,start_month) VALUES (?,?,?,?,?,?,?)').run(randomUUID(),user.id,...values)); return { ok:true };
+    const b = await body(req), [name,amount,currency,original_day,start_month] = subscriptionData(b);
+    (await db.createSubscription({id:randomUUID(),user_id:user.id,name,amount,currency,original_day,start_month})); return { ok:true };
   }
   const sub = /^\/api\/subscriptions\/([\w-]+)$/.exec(path);
   if (sub && ['PATCH','DELETE'].includes(method)) {
-    const row = (await db.prepare('SELECT * FROM subscriptions WHERE id=? AND user_id=? AND active=1').get(sub[1],user.id));
+    const row = (await db.subscription(user.id,sub[1]));
     if (!row) fail('구독을 찾을 수 없습니다.',404);
     const b = await body(req);
-    if (method === 'DELETE') (await db.prepare('UPDATE subscriptions SET active=0 WHERE id=? AND user_id=?').run(row.id,user.id));
+    if (method === 'DELETE') (await db.stopSubscription(user.id,row.id));
     else {
       // 이미 기록된 청구분은 유지하고, 이후 청구에만 서비스명/요금을 적용한다.
       const currency = ['USD','KRW'].includes(b.currency) ? b.currency : fail('통화를 확인해 주세요.');
-      (await db.prepare('UPDATE subscriptions SET name=?,amount=?,currency=? WHERE id=? AND user_id=?').run(text(b.name),amount(b.amount,currency),currency,row.id,user.id));
+      (await db.updateSubscription(user.id,row.id,{name:text(b.name),amount:amount(b.amount,currency),currency}));
     }
     return { ok:true };
   }
   if (path === '/api/admin/users' && method === 'GET') {
     if (user.role !== 'admin') fail('권한이 없습니다.',403);
-    return { users:(await db.prepare('SELECT id,email,name,role,disabled,created_at FROM users ORDER BY created_at').all()) };
+    return { users:(await db.accountProfiles()) };
   }
   const account = /^\/api\/admin\/users\/([\w-]+)$/.exec(path);
   if (account && method === 'PATCH') {
@@ -247,9 +263,8 @@ async function api(req, res, url) {
     if (account[1] === user.id) fail('본인 관리자 계정은 정지할 수 없습니다.');
     const b = await body(req);
     if (typeof b.disabled !== 'boolean') fail('계정 상태를 확인해 주세요.');
-    const r = (await db.prepare("UPDATE users SET disabled=? WHERE id=? AND role!='admin'").run(Number(b.disabled),account[1]));
-    if (!r.changes) fail('계정을 찾을 수 없습니다.',404);
-    (await db.prepare('DELETE FROM sessions WHERE user_id=?').run(account[1])); return { ok:true };
+    if (!await db.setDisabled(account[1],b.disabled)) fail('계정을 찾을 수 없습니다.',404);
+    await db.deleteSessions(account[1]); return { ok:true };
   }
   fail('요청을 찾을 수 없습니다.',404);
 }
@@ -260,13 +275,13 @@ export async function handleRequest(req,res) {
   res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
   try {
     const url = new URL(req.url,appUrl);
-    if (url.pathname.startsWith('/api/')) { res.setHeader('Cache-Control','no-store'); const result = await api(req,res,url); res.writeHead(200,{'Content-Type':'application/json; charset=utf-8'}); res.end(JSON.stringify(result)); return; }
+    if (url.pathname.startsWith('/api/')) { res.setHeader('Cache-Control','no-store'); const result = await api(req,res,url); if (res.writableEnded) return; res.writeHead(200,{'Content-Type':'application/json; charset=utf-8'}); res.end(JSON.stringify(result)); return; }
     if (!['GET','HEAD'].includes(req.method)) fail('지원하지 않는 요청입니다.',405);
     const files = {'/':'index.html','/app.js':'app.js','/styles.css':'styles.css','/favicon.svg':'favicon.svg'};
     const name = files[url.pathname]; if (!name) fail('페이지를 찾을 수 없습니다.',404);
     const content = await readFile(resolve(root,'public',name)); res.writeHead(200,{'Content-Type':mime[extname(name)],'Cache-Control':'no-cache'}); res.end(req.method === 'HEAD' ? undefined : content);
   } catch (e) {
-    const databaseUnavailable = ['42P01','ECONNREFUSED','ENOTFOUND','ETIMEDOUT','28P01'].includes(e.code);
+    const databaseUnavailable = ['42P01','ECONNREFUSED','ENOTFOUND','ETIMEDOUT','28P01',7,8,14,16].includes(e.code);
     res.setHeader('Cache-Control','no-store');
     res.writeHead(e.status || (databaseUnavailable ? 503 : 500),{'Content-Type':'application/json; charset=utf-8'});
     res.end(JSON.stringify({error:e.status?e.message:databaseUnavailable?'데이터 저장소에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.':'처리를 완료하지 못했습니다. 잠시 후 다시 시도해 주세요.'}));
@@ -277,6 +292,6 @@ export default handleRequest;
 const server = process.env.VERCEL ? null : http.createServer(handleRequest);
 server?.listen(port,host,()=>console.log(`머니체크 실행: http://localhost:${port}`));
 let running = false;
-const timer = process.env.VERCEL ? null : setInterval(async()=>{ if(running)return; running=true; try { await ensureStore(); for(const u of (await db.prepare('SELECT id FROM users WHERE disabled=0').all())) await sync(u.id); } catch(e){ console.error('자동 기록 처리 실패:',e.message); } finally { running=false; } },60000);
+const timer = process.env.VERCEL ? null : setInterval(async()=>{ if(running)return; running=true; try { await ensureStore(); for(const u of (await db.activeUsers())) await sync(u.id); } catch(e){ console.error('자동 기록 처리 실패:',e.message); } finally { running=false; } },60000);
 timer?.unref();
 if (!process.env.VERCEL) for (const signal of ['SIGINT','SIGTERM']) process.on(signal,()=>{ clearInterval(timer);server.close(()=>{Promise.resolve(db?.close()).finally(()=>process.exit(0));}); });

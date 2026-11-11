@@ -7,12 +7,18 @@
 - 정적 화면은 `public/`에서 제공한다.
 - API는 `api/index.mjs`를 명시적 함수 진입점으로 사용하며 `/api/*` 요청을 처리한다.
 - Vercel에서는 로컬 SQLite를 열거나 상시 HTTP 서버/타이머를 시작하지 않는다.
-- 운영 데이터는 `DATABASE_URL` 또는 `POSTGRES_URL`에 연결된 PostgreSQL에 저장한다. 로컬 실행은 SQLite를 계속 사용할 수 있다.
+- 현재 운영 데이터는 무료 Spark 프로젝트 `moneycheck-2932b`의 기본 Firestore에 저장한다. 로컬 실행은 SQLite를 계속 사용할 수 있다.
+- `FIREBASE_PROJECT_ID`를 설정하면 Firestore를 사용한다. 운영 서버는 Vercel OIDC와 Google Cloud Workload Identity Federation으로 인증한다. 서비스 계정은 이 프로젝트의 Firestore 데이터 권한만 갖는다.
+- 브라우저의 Firestore 직접 접근은 `firestore.rules`에서 차단한다. 모든 데이터 요청은 Vercel API에서 사용자별 권한을 확인한다.
 - 빌드 시 연결된 PostgreSQL에 `migrations/001_postgres.sql`을 트랜잭션으로 적용한다. 기존 데이터를 삭제하거나 샘플 금융 데이터를 생성하지 않는다.
 - 데이터베이스가 없으면 500으로 프로세스가 종료되는 대신, 화면과 API에 저장소 미연결 상태를 알린다. 저장소 연결 전에는 앱을 사용할 수 없다.
 - Node.js 24.x를 사용한다.
 
-## 최초 연결
+## Firebase 운영 연결
+
+Firebase 프로젝트에 기본 Standard 데이터베이스를 만들고 `firebase.json`의 보안 규칙을 배포한다. 운영 환경에는 `FIREBASE_PROJECT_ID`, `GCP_PROJECT_NUMBER`, `GCP_SERVICE_ACCOUNT_EMAIL`, `GCP_WORKLOAD_IDENTITY_POOL_ID`, `GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID`가 필요하다. Vercel 팀의 `moneycheck` 운영 배포만 Google Cloud의 서비스 계정을 사용할 수 있도록 제한한다. 계정 초기 설정, 예약 실행 및 이메일 변수는 아래와 동일하다.
+
+## PostgreSQL을 사용할 경우
 
 1. Vercel의 `moneycheck` 프로젝트에서 Storage를 열고 Neon PostgreSQL을 생성/연결한다. 무료 플랜을 사용하려면 결제 조건과 한도를 직접 확인한다. 제공자 계정/약관 동의는 소유자가 진행한다.
 2. 연결 대상에 `moneycheck`의 Production을 포함한다. `DATABASE_URL` 또는 `POSTGRES_URL`이 해당 프로젝트의 Production 환경 변수에 제공되어야 한다.

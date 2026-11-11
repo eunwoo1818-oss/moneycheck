@@ -107,3 +107,21 @@ test('예약 기록은 유효한 서버 비밀 값으로만 호출할 수 있다
   const r=await fetch(base+'/api/cron',{headers:{Authorization:'Bearer test-cron-only'}});
   assert.equal(r.status,200);assert.equal((await r.json()).processed,2);
 });
+test('이전 연도는 올해 장부에서 제외되고 본인만 CSV로 저장할 수 있다',async()=>{
+  const year=Number(today().slice(0,4))-1;
+  db.prepare("INSERT INTO transactions(id,user_id,type,amount,date,category,memo) VALUES ('archive-test',?,'expense',1000,?,'식비',?)")
+    .run(adminId,`${year}-12-31`,'=1+2');
+  const current=await request('data','GET',null,admin);
+  assert.equal(current.data.year,today().slice(0,4));
+  assert.ok(!current.data.transactions.some(t=>t.id==='archive-test'));
+  assert.equal((await request('transactions/archive-test','DELETE',{},admin)).status,404);
+  const url=base+`/api/export?year=${year}`;
+  assert.equal((await fetch(url)).status,401);
+  const own=await fetch(url,{headers:{Cookie:admin}});
+  assert.equal(own.status,200);
+  assert.match(own.headers.get('content-disposition'),/\.csv/);
+  assert.match(await own.text(),/"'=1\+2"/);
+  const other=await request('login','POST',{email:'person@example.com',password:'a-new-password'});
+  assert.equal(other.status,200);
+  assert.doesNotMatch(await (await fetch(url,{headers:{Cookie:other.cookie}})).text(),/=1\+2/);
+});

@@ -1,0 +1,13 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 클라이언트 SDK는 사용하지 않는다. 모든 계정/금융 데이터는
+    // 인증된 Vercel 서버의 API를 통해서만 접근한다.
+    // 서버의 IAM 서비스 계정은 별도 인증되며, API에서 사용자별 소유권을 검증한다.
+    // users/{uid}: 계정, users/{uid}/transactions 및 subscriptions: 해당 사용자의 금융 기록.
+    // 내부 이메일 인덱스, 세션, 재설정 토큰, 설정, 환율, 요청 제한도 외부 직접 접근 금지.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
