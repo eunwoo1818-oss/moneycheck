@@ -77,6 +77,16 @@ async function session(res, id) {
   await db.createSession(id,hash(token),Date.now()+7*86400000,Date.now());
   res.setHeader('Set-Cookie', `moneycheck=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800${process.env.COOKIE_SECURE === '1' || process.env.VERCEL ? '; Secure' : ''}`);
 }
+async function paymentData(uid,b,t,existing=null) {
+  if(t!=='expense') return {payment_method:null,card_company:null};
+  if(b.payment_method===undefined) return {payment_method:existing?.payment_method||null,card_company:existing?.card_company||null};
+  if(b.payment_method==='' || b.payment_method===null) return {payment_method:null,card_company:null};
+  if(!['cash','card'].includes(b.payment_method)) fail('현금 또는 카드를 선택해 주세요.');
+  if(b.payment_method==='cash') return {payment_method:'cash',card_company:null};
+  const company=text(b.card_company,40);
+  if(!await db.hasCardCompany(uid,company)) fail('카드사를 먼저 등록해 주세요.');
+  return {payment_method:'card',card_company:company};
+}
 async function getRate(day) {
   const cached = (await db.exchangeRate(day));
   if (cached) return cached;
@@ -203,7 +213,7 @@ async function api(req, res, url) {
     const parsed = parseCardSms(await body(req));
     if (!parsed) return {ok:true,recorded:false,message:'지원하지 않는 문자입니다. 직접 확인해 주세요.'};
     const {event,...t} = parsed;
-    const result = await db.createTransaction({...t,id:'sms-'+hash(device.id+':'+event),user_id:device.id},true);
+    const result = await db.createTransaction({...t,payment_method:'card',id:'sms-'+hash(device.id+':'+event),user_id:device.id},true);
     return {ok:true,recorded:!!result.changes,message:result.changes?'장부에 기록했습니다.':'이미 처리한 문자입니다.'};
   }
   const user = await auth(req);
@@ -222,13 +232,13 @@ async function api(req, res, url) {
     if (!/^\d{4}$/.test(year) || Number(year)<2000 || year>today().slice(0,4)) fail('저장할 연도를 확인해 주세요.');
     if (year===today().slice(0,4)) await sync(user.id);
     const rows = await db.transactions(user.id,year);
-    const columns = ['날짜','구분','카테고리','금액(원)','메모','청구 월','원래 금액','통화','적용 환율','환율 기준일'];
+    const columns = ['결제수단','카드사','날짜','구분','카테고리','금액(원)','메모','청구 월','원래 금액','통화','적용 환율','환율 기준일'];
     const cell = value => {
       let text = String(value ?? '');
       if (typeof value === 'string' && /^[\s]*[=+\-@]/.test(text)) text = "'" + text;
       return '"' + text.replaceAll('"','""') + '"';
     };
-    const lines = [columns,...rows.map(t=>[t.date,t.type==='income'?'수입':'지출',t.category==='구독'?'고정지출':t.category,t.amount,t.memo,t.billing_month,t.original_amount,t.currency,t.rate,t.rate_date])];
+    const lines = [columns,...rows.map(t=>[t.payment_method==='card'?'카드':t.payment_method==='cash'?'현금':'미지정',t.card_company||'',t.date,t.type==='income'?'수입':'지출',t.category==='구독'?'고정지출':t.category,t.amount,t.memo,t.billing_month,t.original_amount,t.currency,t.rate,t.rate_date])];
     res.writeHead(200,{'Content-Type':'text/csv; charset=utf-8','Content-Disposition':`attachment; filename="moneycheck-${year}.csv"`});
     res.end('\uFEFF'+lines.map(line=>line.map(cell).join(',')).join('\r\n')+'\r\n');
     return;
@@ -240,7 +250,10 @@ async function api(req, res, url) {
   if (path === '/api/data' && method === 'GET') {
     const year = today().slice(0,4);
     const warnings = await sync(user.id);
-    return { user, year, today:today(), warnings, transactions:(await db.transactions(user.id,year)).map(t=>({...t,category:t.category==='구독'?'고정지출':t.category})), subscriptions:await Promise.all((await db.subscriptions(user.id)).map(upcoming)), categories:(await db.categories(user.id)).map(c=>({...c,name:c.name==='구독'?'고정지출':c.name})).filter((c,i,a)=>a.findIndex(v=>v.type===c.type&&v.name===c.name)===i) };
+    return { user, year, today:today(), warnings, cardCompanies:await db.cardCompanies(user.id), transactions:(await db.transactions(user.id,year)).map(t=>({...t,category:t.category==='구독'?'고정지출':t.category})), subscriptions:await Promise.all((await db.subscriptions(user.id)).map(upcoming)), categories:(await db.categories(user.id)).map(c=>({...c,name:c.name==='구독'?'고정지출':c.name})).filter((c,i,a)=>a.findIndex(v=>v.type===c.type&&v.name===c.name)===i) };
+  }
+  if (path === '/api/card-companies' && method === 'POST') {
+    const b=await body(req);await db.addCardCompany(user.id,text(b.name,40));return {ok:true};
   }
   if (path === '/api/categories' && method === 'POST') {
     const b = await body(req); (await db.addCategory(user.id,type(b.type),text(b.name,30))); return { ok:true };
@@ -248,7 +261,7 @@ async function api(req, res, url) {
   if (path === '/api/transactions' && method === 'POST') {
     const b = await body(req), t = type(b.type), c = text(b.category,30);
     if (!(await db.hasCategory(user.id,t,c)) && !(c==='고정지출' && await db.hasCategory(user.id,t,'구독'))) fail('카테고리를 먼저 추가해 주세요.');
-    (await db.createTransaction({id:randomUUID(),user_id:user.id,type:t,amount:amount(b.amount),date:ledgerDate(b.date),category:c,memo:typeof b.memo==='string'&&b.memo.length<=500?b.memo:''})); return { ok:true };
+    (await db.createTransaction({...await paymentData(user.id,b,t),id:randomUUID(),user_id:user.id,type:t,amount:amount(b.amount),date:ledgerDate(b.date),category:c,memo:typeof b.memo==='string'&&b.memo.length<=500?b.memo:''})); return { ok:true };
   }
   const tx = /^\/api\/transactions\/([\w-]+)$/.exec(path);
   if (tx && ['PATCH','DELETE'].includes(method)) {
@@ -258,7 +271,7 @@ async function api(req, res, url) {
     else {
       const b = await body(req), t = row.subscription_id ? 'expense' : type(b.type), c = text(b.category,30);
       if (!(await db.hasCategory(user.id,t,c)) && !(c==='고정지출' && await db.hasCategory(user.id,t,'구독'))) fail('카테고리를 확인해 주세요.');
-      (await db.updateTransaction(user.id,row.id,{type:t,amount:amount(b.amount),date:ledgerDate(b.date),category:c,memo:typeof b.memo==='string'&&b.memo.length<=500?b.memo:''}));
+      (await db.updateTransaction(user.id,row.id,{...await paymentData(user.id,b,t,row),type:t,amount:amount(b.amount),date:ledgerDate(b.date),category:c,memo:typeof b.memo==='string'&&b.memo.length<=500?b.memo:''}));
     }
     return { ok:true };
   }

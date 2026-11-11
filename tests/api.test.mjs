@@ -159,3 +159,28 @@ test('이전 구독 분류도 고정지출로 표시하고 수정·CSV 저장한
   assert.equal((await request('transactions/legacy-fixed','PATCH',{type:'expense',amount:10000,date:today(),category:'고정지출'},admin)).status,200);
   const file=await fetch(base+'/api/export',{headers:{Cookie:admin}});assert.match(await file.text(),/고정지출/);
 });
+
+test('현금·카드와 사용자별 카드사를 저장하고 결제수단 변경·CSV·기존 내역을 처리한다',async()=>{
+  assert.equal((await request('card-companies','POST',{name:'신한카드'})).status,401);
+  for(const name of ['', ' '.repeat(3),'가'.repeat(41)])assert.equal((await request('card-companies','POST',{name},admin)).status,400);
+  for(let i=0;i<2;i++)assert.equal((await request('card-companies','POST',{name:' 신한카드 '},admin)).status,200);
+  let data=(await request('data','GET',null,admin)).data;
+  assert.deepEqual(data.cardCompanies,[{name:'신한카드'}]);
+  const login=await request('login','POST',{email:'person@example.com',password:'a-new-password'});
+  assert.deepEqual((await request('data','GET',null,login.cookie)).data.cardCompanies,[]);
+  const draft={type:'expense',amount:30300,date:today(),category:'기타',memo:'카드 테스트',payment_method:'card',card_company:'신한카드'};
+  assert.equal((await request('transactions','POST',draft,login.cookie)).status,400);
+  for(const extra of [{payment_method:'unknown'},{card_company:''},{card_company:'없는 카드사'}])assert.equal((await request('transactions','POST',{...draft,...extra},admin)).status,400);
+  assert.equal((await request('transactions','POST',draft,admin)).status,200);
+  data=(await request('data','GET',null,admin)).data;
+  const row=data.transactions.find(t=>t.memo===draft.memo);assert.equal(row.payment_method,'card');assert.equal(row.card_company,'신한카드');
+  const csv=await fetch(base+'/api/export',{headers:{Cookie:admin}});assert.match(await csv.text(),/"카드","신한카드"/);
+  const {payment_method,card_company,...oldClient}=draft;
+  await request('transactions/'+row.id,'PATCH',{...oldClient,amount:31000},admin);
+  assert.equal((await request('data','GET',null,admin)).data.transactions.find(t=>t.id===row.id).card_company,'신한카드');
+  await request('transactions/'+row.id,'PATCH',{...draft,payment_method:'cash'},admin);
+  let saved=(await request('data','GET',null,admin)).data.transactions.find(t=>t.id===row.id);assert.equal(saved.payment_method,'cash');assert.equal(saved.card_company,null);
+  await request('transactions/'+row.id,'PATCH',{...draft,type:'income'},admin);
+  saved=(await request('data','GET',null,admin)).data.transactions.find(t=>t.id===row.id);assert.equal(saved.payment_method,null);assert.equal(saved.card_company,null);
+  const legacy=(await request('data','GET',null,admin)).data.transactions.find(t=>t.id==='legacy-fixed');assert.equal(legacy.payment_method,null);
+});

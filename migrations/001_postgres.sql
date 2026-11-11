@@ -41,3 +41,7 @@ CREATE INDEX IF NOT EXISTS transactions_user_date ON transactions(user_id,date);
 CREATE INDEX IF NOT EXISTS subscriptions_user_active ON subscriptions(user_id,active);
 CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
 CREATE TABLE IF NOT EXISTS sms_devices (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, token TEXT UNIQUE NOT NULL, expires BIGINT NOT NULL);
+
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS payment_method TEXT;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS card_company TEXT;
+CREATE TABLE IF NOT EXISTS card_companies (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, PRIMARY KEY(user_id,name));
