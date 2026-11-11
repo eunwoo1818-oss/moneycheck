@@ -125,3 +125,37 @@ test('이전 연도는 올해 장부에서 제외되고 본인만 CSV로 저장�
   assert.equal(other.status,200);
   assert.doesNotMatch(await (await fetch(url,{headers:{Cookie:other.cookie}})).text(),/=1\+2/);
 });
+
+test('카드 문자 연결은 소유자만 발급·해제하고 중복·삭제 문자와 다른 계정을 격리한다',async()=>{
+  assert.equal((await request('sms/device','POST')).status,401);
+  const {data:{token}}=await request('sms/device','POST',{},admin);
+  assert.match(token,/^[a-f0-9]{64}$/);
+  assert.notEqual(db.prepare('SELECT token FROM sms_devices WHERE user_id=?').get(adminId).token,token);
+  const receivedAt=Date.now(),day=today().replaceAll('-','.');
+  const payload={sender:'15447000',message:`신한카드 ${day} 30300 GS편의점`,receivedAt,user_id:personId};
+  const ingest=async (key=token,data=payload)=>{
+    const res=await fetch(base+'/api/sms/receive',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+key},body:JSON.stringify(data)});
+    return {status:res.status,data:await res.json()};
+  };
+  assert.equal((await ingest()).data.recorded,true);
+  const retry=await Promise.all([ingest(),ingest()]);assert.ok(retry.every(r=>r.data.recorded===false));
+  const row=db.prepare("SELECT * FROM transactions WHERE id LIKE 'sms-%'").get();assert.equal(row.user_id,adminId);assert.equal(row.amount,30300);assert.doesNotMatch(row.memo,/15447000/);
+  await request('transactions/'+row.id,'DELETE',{},admin);assert.equal((await ingest()).data.recorded,false);
+  assert.equal((await ingest(token,{...payload,message:'인증 번호 123456'})).data.recorded,false);
+  assert.equal((await ingest('f'.repeat(64))).status,401);
+  const rotated=await request('sms/device','POST',{},admin);assert.equal((await ingest()).status,401);
+  assert.equal((await ingest(rotated.data.token)).status,200);
+  await request('sms/device','DELETE',{},admin);assert.equal((await ingest(rotated.data.token)).status,401);
+  assert.equal((await request('sms/device','GET',null,admin)).data.connected,false);
+});
+
+test('이전 구독 분류도 고정지출로 표시하고 수정·CSV 저장한다',async()=>{
+  db.prepare("DELETE FROM categories WHERE user_id=? AND name='고정지출'").run(adminId);
+  db.prepare("INSERT OR IGNORE INTO categories VALUES (?,'expense','구독')").run(adminId);
+  db.prepare("INSERT INTO transactions(id,user_id,type,amount,date,category) VALUES ('legacy-fixed',?,'expense',9900,?,'구독')").run(adminId,today());
+  const data=(await request('data','GET',null,admin)).data;
+  assert.equal(data.transactions.find(t=>t.id==='legacy-fixed').category,'고정지출');
+  assert.ok(!data.categories.some(c=>c.name==='구독'));
+  assert.equal((await request('transactions/legacy-fixed','PATCH',{type:'expense',amount:10000,date:today(),category:'고정지출'},admin)).status,200);
+  const file=await fetch(base+'/api/export',{headers:{Cookie:admin}});assert.match(await file.text(),/고정지출/);
+});

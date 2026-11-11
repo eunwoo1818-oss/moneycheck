@@ -9,3 +9,7 @@ firestore-debug.log
 .firebase/
 *.sqlite*
 test-results/
+.android-tools/
+android/.gradle/
+android/local.properties
+android/**/build/

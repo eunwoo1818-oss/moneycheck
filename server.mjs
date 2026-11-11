@@ -5,6 +5,7 @@ import { resolve, extname } from 'node:path';
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
 import { sqlRepository } from './lib/sql-repository.mjs';
 import { defaults } from './lib/categories.mjs';
+import { parseCardSms } from './lib/card-sms.mjs';
 import { today, validDate, billDate, nextMonth, occurrences } from './lib/billing.mjs';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
@@ -96,7 +97,7 @@ async function sync(userId) {
       if (s.currency === 'USD') {
         try { fx = await getRate(bill.date); } catch { warnings.push(`${s.name}: ${bill.date} 환율을 확인할 수 없어 자동 기록을 보류했습니다.`); break; }
       }
-      (await db.createTransaction({id:randomUUID(),user_id:userId,type:'expense',amount:Math.max(1,Math.round(s.amount*fx.rate)),date:bill.date,category:'구독',memo:s.name,subscription_id:s.id,billing_month:bill.month,original_amount:s.amount,currency:s.currency,rate:fx.rate,rate_date:fx.rate_date},true));
+      (await db.createTransaction({id:randomUUID(),user_id:userId,type:'expense',amount:Math.max(1,Math.round(s.amount*fx.rate)),date:bill.date,category:'고정지출',memo:s.name,subscription_id:s.id,billing_month:bill.month,original_amount:s.amount,currency:s.currency,rate:fx.rate,rate_date:fx.rate_date},true));
     }
   }
   return warnings;
@@ -158,7 +159,7 @@ async function api(req, res, url) {
       if (typeof b.setupCode!=='string' || !timingSafeEqual(Buffer.from(hash(b.setupCode.trim()),'hex'),Buffer.from(hash(setupCode),'hex'))) fail('관리자 설정 코드를 확인해 주세요.',403);
     }
     const categories = Object.entries(defaults).flatMap(([type,names])=>names.map(name=>({type,name})));
-    categories.push({type:'expense',name:'구독'});
+    categories.push({type:'expense',name:'고정지출'});
     try { await db.createUser({id,email:mail,name,password:digest(pass),role:first?'admin':'user'},categories); } catch(error) {
       if (['23505','ERR_SQLITE_ERROR'].includes(error.code)) fail('계정을 만들 수 없습니다. 이미 등록되었는지 확인해 주세요.',409);
       throw error;
@@ -194,8 +195,28 @@ async function api(req, res, url) {
     if (!await db.consumeReset(hash(b.token),Date.now(),digest(pass))) fail('만료되었거나 이미 사용한 링크입니다.');
     return { ok:true };
   }
+  if (path === '/api/sms/receive' && method === 'POST') {
+    const token = /^Bearer ([a-f0-9]{64})$/.exec(req.headers.authorization || '')?.[1];
+    const device = token && await db.smsUser(hash(token),Date.now());
+    if (!device) fail('문자 연결이 만료되었거나 해제되었습니다.',401);
+    if (await db.rateLimit(hash('sms:'+device.id),Date.now()) > 300) fail('잠시 후 다시 시도해 주세요.',429);
+    const parsed = parseCardSms(await body(req));
+    if (!parsed) return {ok:true,recorded:false,message:'지원하지 않는 문자입니다. 직접 확인해 주세요.'};
+    const {event,...t} = parsed;
+    const result = await db.createTransaction({...t,id:'sms-'+hash(device.id+':'+event),user_id:device.id},true);
+    return {ok:true,recorded:!!result.changes,message:result.changes?'장부에 기록했습니다.':'이미 처리한 문자입니다.'};
+  }
   const user = await auth(req);
   if (!user) fail('로그인이 필요합니다.',401);
+  if (path === '/api/sms/device') {
+    if (method === 'GET') {const d=await db.smsDevice(user.id);return {connected:!!d&&d.expires>Date.now()};}
+    if (method === 'DELETE') {await body(req);await db.deleteSmsDevice(user.id);return {ok:true};}
+    if (method === 'POST') {
+      await body(req);const token=randomBytes(32).toString('hex');
+      await db.setSmsDevice(user.id,hash(token),Date.now()+365*86400000);
+      return {token};
+    }
+  }
   if (path === '/api/export' && method === 'GET') {
     const year = url.searchParams.get('year') || today().slice(0,4);
     if (!/^\d{4}$/.test(year) || Number(year)<2000 || year>today().slice(0,4)) fail('저장할 연도를 확인해 주세요.');
@@ -207,7 +228,7 @@ async function api(req, res, url) {
       if (typeof value === 'string' && /^[\s]*[=+\-@]/.test(text)) text = "'" + text;
       return '"' + text.replaceAll('"','""') + '"';
     };
-    const lines = [columns,...rows.map(t=>[t.date,t.type==='income'?'수입':'지출',t.category,t.amount,t.memo,t.billing_month,t.original_amount,t.currency,t.rate,t.rate_date])];
+    const lines = [columns,...rows.map(t=>[t.date,t.type==='income'?'수입':'지출',t.category==='구독'?'고정지출':t.category,t.amount,t.memo,t.billing_month,t.original_amount,t.currency,t.rate,t.rate_date])];
     res.writeHead(200,{'Content-Type':'text/csv; charset=utf-8','Content-Disposition':`attachment; filename="moneycheck-${year}.csv"`});
     res.end('\uFEFF'+lines.map(line=>line.map(cell).join(',')).join('\r\n')+'\r\n');
     return;
@@ -219,14 +240,14 @@ async function api(req, res, url) {
   if (path === '/api/data' && method === 'GET') {
     const year = today().slice(0,4);
     const warnings = await sync(user.id);
-    return { user, year, today:today(), warnings, transactions:(await db.transactions(user.id,year)), subscriptions:await Promise.all((await db.subscriptions(user.id)).map(upcoming)), categories:(await db.categories(user.id)) };
+    return { user, year, today:today(), warnings, transactions:(await db.transactions(user.id,year)).map(t=>({...t,category:t.category==='구독'?'고정지출':t.category})), subscriptions:await Promise.all((await db.subscriptions(user.id)).map(upcoming)), categories:(await db.categories(user.id)).map(c=>({...c,name:c.name==='구독'?'고정지출':c.name})).filter((c,i,a)=>a.findIndex(v=>v.type===c.type&&v.name===c.name)===i) };
   }
   if (path === '/api/categories' && method === 'POST') {
     const b = await body(req); (await db.addCategory(user.id,type(b.type),text(b.name,30))); return { ok:true };
   }
   if (path === '/api/transactions' && method === 'POST') {
     const b = await body(req), t = type(b.type), c = text(b.category,30);
-    if (!(await db.hasCategory(user.id,t,c))) fail('카테고리를 먼저 추가해 주세요.');
+    if (!(await db.hasCategory(user.id,t,c)) && !(c==='고정지출' && await db.hasCategory(user.id,t,'구독'))) fail('카테고리를 먼저 추가해 주세요.');
     (await db.createTransaction({id:randomUUID(),user_id:user.id,type:t,amount:amount(b.amount),date:ledgerDate(b.date),category:c,memo:typeof b.memo==='string'&&b.memo.length<=500?b.memo:''})); return { ok:true };
   }
   const tx = /^\/api\/transactions\/([\w-]+)$/.exec(path);
@@ -236,7 +257,7 @@ async function api(req, res, url) {
     if (method === 'DELETE') { await body(req); (await db.deleteTransaction(user.id,row.id)); }
     else {
       const b = await body(req), t = row.subscription_id ? 'expense' : type(b.type), c = text(b.category,30);
-      if (!(await db.hasCategory(user.id,t,c))) fail('카테고리를 확인해 주세요.');
+      if (!(await db.hasCategory(user.id,t,c)) && !(c==='고정지출' && await db.hasCategory(user.id,t,'구독'))) fail('카테고리를 확인해 주세요.');
       (await db.updateTransaction(user.id,row.id,{type:t,amount:amount(b.amount),date:ledgerDate(b.date),category:c,memo:typeof b.memo==='string'&&b.memo.length<=500?b.memo:''}));
     }
     return { ok:true };
@@ -248,7 +269,7 @@ async function api(req, res, url) {
   const sub = /^\/api\/subscriptions\/([\w-]+)$/.exec(path);
   if (sub && ['PATCH','DELETE'].includes(method)) {
     const row = (await db.subscription(user.id,sub[1]));
-    if (!row) fail('구독을 찾을 수 없습니다.',404);
+    if (!row) fail('고정지출을 찾을 수 없습니다.',404);
     const b = await body(req);
     if (method === 'DELETE') (await db.stopSubscription(user.id,row.id));
     else {
@@ -273,7 +294,7 @@ async function api(req, res, url) {
   }
   fail('요청을 찾을 수 없습니다.',404);
 }
-const mime = {'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.svg':'image/svg+xml'};
+const mime = {'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.svg':'image/svg+xml','.apk':'application/vnd.android.package-archive'};
 export async function handleRequest(req,res) {
   res.setHeader('X-Content-Type-Options','nosniff'); res.setHeader('X-Frame-Options','DENY');
   res.setHeader('Referrer-Policy','no-referrer');
@@ -282,7 +303,7 @@ export async function handleRequest(req,res) {
     const url = new URL(req.url,appUrl);
     if (url.pathname.startsWith('/api/')) { res.setHeader('Cache-Control','no-store'); const result = await api(req,res,url); if (res.writableEnded) return; res.writeHead(200,{'Content-Type':'application/json; charset=utf-8'}); res.end(JSON.stringify(result)); return; }
     if (!['GET','HEAD'].includes(req.method)) fail('지원하지 않는 요청입니다.',405);
-    const files = {'/':'index.html','/app.js':'app.js','/styles.css':'styles.css','/favicon.svg':'favicon.svg'};
+    const files = {'/':'index.html','/app.js':'app.js','/styles.css':'styles.css','/favicon.svg':'favicon.svg','/downloads/moneycheck-sms.apk':'downloads/moneycheck-sms.apk'};
     const name = files[url.pathname]; if (!name) fail('페이지를 찾을 수 없습니다.',404);
     const content = await readFile(resolve(root,'public',name)); res.writeHead(200,{'Content-Type':mime[extname(name)],'Cache-Control':'no-cache'}); res.end(req.method === 'HEAD' ? undefined : content);
   } catch (e) {
