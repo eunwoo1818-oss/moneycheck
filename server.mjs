@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { resolve, extname } from 'node:path';
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
 import { sqlRepository } from './lib/sql-repository.mjs';
-import { defaults } from './lib/categories.mjs';
+import { defaults, orderedCategories } from './lib/categories.mjs';
 import { parseCardSms, parseIphoneSms } from './lib/card-sms.mjs';
 import { monthlyExpenses, monthlyIncome } from './lib/reports.mjs';
 import { today, validDate, billDate, nextMonth, occurrences } from './lib/billing.mjs';
@@ -219,6 +219,16 @@ async function api(req, res, url) {
   }
   const user = await auth(req);
   if (!user) fail('로그인이 필요합니다.',401);
+  if (path === '/api/account/password' && method === 'POST') {
+    await rateLimit(req,'change-password',10);const b=await body(req), pass=password(b.password), u=await db.findUserByEmail(user.email);
+    if(typeof b.current_password!=='string'||!verify(b.current_password,u.password))fail('현재 비밀번호를 확인해 주세요.',403);
+    if(pass==='1234asdf!@#'||verify(pass,u.password))fail('임시 비밀번호와 다른 새 비밀번호를 입력해 주세요.');
+    if(!await db.replacePassword(user.id,digest(pass),false,u.password))fail('비밀번호가 변경되었습니다. 다시 로그인해 주세요.',409);await session(res,user.id);return {ok:true};
+  }
+  if(user.must_change_password && path!=='/api/logout'){
+    if(path==='/api/data'&&method==='GET')return {passwordChangeRequired:true};
+    fail('초기화된 비밀번호를 먼저 변경해 주세요.',403);
+  }
   if (path === '/api/sms/device') {
     if (method === 'GET') {const d=await db.smsDevice(user.id);return {connected:!!d&&d.expires>Date.now()};}
     if (method === 'DELETE') {await body(req);await db.deleteSmsDevice(user.id);return {ok:true};}
@@ -253,7 +263,22 @@ async function api(req, res, url) {
     const warnings = await sync(user.id);
     const transactions = await db.transactions(user.id,year);
     const previous = await db.transactions(user.id,String(Number(year)-1));
-    return { user, year, today:today(), warnings, monthlyIncome:monthlyIncome([...previous,...transactions]), monthlyExpenses:monthlyExpenses([...previous,...transactions]), cardCompanies:await db.cardCompanies(user.id), transactions:transactions.map(t=>({...t,category:t.category==='구독'?'고정지출':t.category})), subscriptions:await Promise.all((await db.subscriptions(user.id)).map(upcoming)), categories:(await db.categories(user.id)).map(c=>({...c,name:c.name==='구독'?'고정지출':c.name})).filter((c,i,a)=>a.findIndex(v=>v.type===c.type&&v.name===c.name)===i) };
+    return { user, year, today:today(), warnings, monthlyIncome:monthlyIncome([...previous,...transactions]), monthlyExpenses:monthlyExpenses([...previous,...transactions]), cardCompanies:await db.cardCompanies(user.id), transactions:transactions.map(t=>({...t,category:t.category==='구독'?'고정지출':t.category})), subscriptions:await Promise.all((await db.subscriptions(user.id)).map(upcoming)), categories:orderedCategories(await db.categories(user.id),await db.categoryOrder(user.id)) };
+  }
+  if (path === '/api/calendar' && method === 'GET') {
+    const month=url.searchParams.get('month');
+    if(!/^20\d{2}-(0[1-9]|1[0-2])$/.test(month||'') || month>today().slice(0,4)+'-12')fail('조회할 달을 확인해 주세요.');
+    const rows=await db.transactions(user.id,month.slice(0,4));
+    return {month,transactions:rows.filter(t=>t.date.startsWith(month+'-')).map(t=>({...t,category:t.category==='구독'?'고정지출':t.category}))};
+  }
+  if (path === '/api/categories/order' && method === 'PUT') {
+    const b=await body(req), current=orderedCategories(await db.categories(user.id)), order={};
+    for(const kind of ['expense','income']){
+      const names=b[kind], existing=current.filter(c=>c.type===kind).map(c=>c.name);
+      if(!Array.isArray(names)||names.length!==existing.length||new Set(names).size!==names.length||names.some(n=>typeof n!=='string'||!existing.includes(n)))fail('카테고리 목록이 변경되었습니다. 설정을 다시 열어 주세요.');
+      order[kind]=names;
+    }
+    await db.setCategoryOrder(user.id,order);return {ok:true};
   }
   if (path === '/api/card-companies' && method === 'POST') {
     const b=await body(req);await db.addCardCompany(user.id,text(b.name,40));return {ok:true};
@@ -298,6 +323,13 @@ async function api(req, res, url) {
   if (path === '/api/admin/users' && method === 'GET') {
     if (user.role !== 'admin') fail('권한이 없습니다.',403);
     return { users:(await db.accountProfiles()) };
+  }
+  const resetAccount=/^\/api\/admin\/users\/([\w-]+)\/reset-password$/.exec(path);
+  if(resetAccount && method==='POST'){
+    if(user.role!=='admin')fail('권한이 없습니다.',403);
+    await body(req);await rateLimit(req,'admin-reset-password',20);
+    if(!await db.replacePassword(resetAccount[1],digest('1234asdf!@#'),true))fail('초기화할 사용자 계정을 찾을 수 없습니다.',404);
+    return {ok:true};
   }
   const account = /^\/api\/admin\/users\/([\w-]+)$/.exec(path);
   if (account && method === 'PATCH') {

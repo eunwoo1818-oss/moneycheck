@@ -201,3 +201,56 @@ test('아이폰 문자 본문 자동 등록은 재시도·토큰 해제·읽기 
   assert.equal((await fetch(base+'/api/data',{headers:{Authorization:'Bearer '+token}})).status,401);
   await request('sms/device','DELETE',{},admin);assert.equal((await send(message)).status,401);
 });
+
+test('카테고리 순서를 계정별로 저장하고 잘못된 목록을 거부한다',async()=>{
+  assert.equal((await request('categories/order','PUT',{})).status,401);
+  const original=(await request('data','GET',null,admin)).data.categories;
+  const order=Object.fromEntries(['expense','income'].map(kind=>[kind,original.filter(c=>c.type===kind).map(c=>c.name).reverse()]));
+  assert.equal((await request('categories/order','PUT',order,admin)).status,200);
+  const saved=(await request('data','GET',null,admin)).data.categories;
+  for(const kind of ['expense','income'])assert.deepEqual(saved.filter(c=>c.type===kind).map(c=>c.name),order[kind]);
+  assert.equal((await request('categories/order','PUT',{...order,expense:['없음']},admin)).status,400);
+  assert.equal((await request('categories/order','PUT',{...order,income:order.income.map(()=>order.income[0])},admin)).status,400);
+  const login=await request('login','POST',{email:'person@example.com',password:'a-new-password'});
+  assert.equal(db.prepare('SELECT value FROM category_orders WHERE user_id=?').get(personId),undefined);
+  assert.equal((await request('data','GET',null,login.cookie)).status,200);
+  await request('categories','POST',{type:'expense',name:'추가분류'},admin);
+  assert.equal((await request('data','GET',null,admin)).data.categories.filter(c=>c.type==='expense').at(-1).name,'추가분류');
+});
+
+test('달력 조회는 이전 연도·월 경계와 계정 격리를 지키고 수정은 계속 거부한다',async()=>{
+  const month=(Number(today().slice(0,4))-1)+'-12';
+  assert.equal((await request('calendar?month='+month)).status,401);
+  const own=await request('calendar?month='+month,'GET',null,admin);
+  assert.equal(own.status,200);assert.equal(own.data.transactions.length,1);assert.equal(own.data.transactions[0].id,'archive-test');
+  for(const bad of ['2026-13','1999-01','2111-01','invalid'])assert.equal((await request('calendar?month='+bad,'GET',null,admin)).status,400);
+  const login=await request('login','POST',{email:'person@example.com',password:'a-new-password'});
+  assert.equal((await request('calendar?month='+month,'GET',null,login.cookie)).data.transactions.length,0);
+  assert.equal((await request('transactions/archive-test','PATCH',{amount:1},admin)).status,404);
+});
+
+test('관리자 임시 비밀번호 초기화는 기존 세션·복구 링크·문자 키를 폐기하고 비밀번호 변경을 강제한다',async()=>{
+  const login=await request('login','POST',{email:'person@example.com',password:'a-new-password'}), old=login.cookie;
+  const device=(await request('sms/device','POST',{},old)).data.token;
+  const reset='d'.repeat(64);db.prepare('INSERT INTO resets VALUES (?,?,?)').run(createHash('sha256').update(reset).digest('hex'),personId,Date.now()+60000);
+  const path='admin/users/'+personId+'/reset-password';
+  assert.equal((await request(path,'POST',{},old)).status,403);
+  assert.equal((await request('admin/users/'+adminId+'/reset-password','POST',{},admin)).status,404);
+  assert.equal((await request(path,'POST',{},admin)).status,200);
+  assert.equal((await request('data','GET',null,old)).status,401);
+  assert.notEqual(db.prepare('SELECT password FROM users WHERE id=?').get(personId).password,'1234asdf!@#');
+  assert.equal((await request('login','POST',{email:'person@example.com',password:'a-new-password'})).status,401);
+  const temp=await request('login','POST',{email:'person@example.com',password:'1234asdf!@#'});assert.equal(temp.status,200);
+  assert.deepEqual((await request('data','GET',null,temp.cookie)).data,{passwordChangeRequired:true});
+  assert.equal((await request('export','GET',null,temp.cookie)).status,403);
+  assert.equal((await request('categories/order','PUT',{},temp.cookie)).status,403);
+  const sms=await fetch(base+'/api/sms/iphone',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+device},body:'{}'});assert.equal(sms.status,401);
+  assert.equal((await request('reset','POST',{token:reset,password:'not-allowed-password'})).status,400);
+  assert.equal((await request('account/password','POST',{current_password:'wrong',password:'new-correct-password'},temp.cookie)).status,403);
+  assert.equal((await request('account/password','POST',{current_password:'1234asdf!@#',password:'1234asdf!@#'},temp.cookie)).status,400);
+  const changed=await request('account/password','POST',{current_password:'1234asdf!@#',password:'new-correct-password'},temp.cookie);assert.equal(changed.status,200);
+  assert.equal((await request('data','GET',null,temp.cookie)).status,401);
+  assert.equal((await request('data','GET',null,changed.cookie)).status,200);
+  assert.equal((await request('login','POST',{email:'person@example.com',password:'1234asdf!@#'})).status,401);
+  assert.equal((await request('login','POST',{email:'person@example.com',password:'new-correct-password'})).status,200);
+});
