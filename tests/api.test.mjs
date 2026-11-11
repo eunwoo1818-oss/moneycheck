@@ -254,3 +254,16 @@ test('관리자 임시 비밀번호 초기화는 기존 세션·복구 링크·�
   assert.equal((await request('login','POST',{email:'person@example.com',password:'1234asdf!@#'})).status,401);
   assert.equal((await request('login','POST',{email:'person@example.com',password:'new-correct-password'})).status,200);
 });
+
+test('이전 계정에 새 세부 분류를 노출하고 별도 등록 없이 입력·수정·CSV 저장한다',async()=>{
+  db.prepare("DELETE FROM categories WHERE user_id=? AND name LIKE '% · %'").run(adminId);
+  const before=(await request('data','GET',null,admin)).data;
+  assert.ok(before.categories.some(c=>c.name==='식비 · 외식'&&c.type==='expense'));
+  const draft={type:'expense',amount:20000,date:today(),category:'식비 · 외식',memo:'세부항목검증',payment_method:'cash'};
+  assert.equal((await request('transactions','POST',draft,admin)).status,200);
+  const row=(await request('data','GET',null,admin)).data.transactions.find(t=>t.memo===draft.memo);
+  assert.equal((await request('transactions/'+row.id,'PATCH',{...draft,category:'식비 · 장보기'},admin)).status,200);
+  assert.equal((await request('transactions','POST',{...draft,type:'income',category:'급여 · 상여금'},admin)).status,200);
+  assert.equal((await request('transactions','POST',{...draft,type:'income',category:'식비 · 장보기'},admin)).status,400);
+  const csv=await fetch(base+'/api/export',{headers:{Cookie:admin}});assert.match(await csv.text(),/식비 · 장보기/);
+});

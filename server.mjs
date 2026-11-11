@@ -288,7 +288,7 @@ async function api(req, res, url) {
   }
   if (path === '/api/transactions' && method === 'POST') {
     const b = await body(req), t = type(b.type), c = text(b.category,30);
-    if (!(await db.hasCategory(user.id,t,c)) && !(c==='고정지출' && await db.hasCategory(user.id,t,'구독'))) fail('카테고리를 먼저 추가해 주세요.');
+    if (!defaults[t].includes(c) && !(await db.hasCategory(user.id,t,c)) && !(c==='고정지출' && await db.hasCategory(user.id,t,'구독'))) fail('카테고리를 먼저 추가해 주세요.');
     (await db.createTransaction({...await paymentData(user.id,b,t),id:randomUUID(),user_id:user.id,type:t,amount:amount(b.amount),date:ledgerDate(b.date),category:c,memo:typeof b.memo==='string'&&b.memo.length<=500?b.memo:''})); return { ok:true };
   }
   const tx = /^\/api\/transactions\/([\w-]+)$/.exec(path);
@@ -298,7 +298,7 @@ async function api(req, res, url) {
     if (method === 'DELETE') { await body(req); (await db.deleteTransaction(user.id,row.id)); }
     else {
       const b = await body(req), t = row.subscription_id ? 'expense' : type(b.type), c = text(b.category,30);
-      if (!(await db.hasCategory(user.id,t,c)) && !(c==='고정지출' && await db.hasCategory(user.id,t,'구독'))) fail('카테고리를 확인해 주세요.');
+      if (!defaults[t].includes(c) && !(await db.hasCategory(user.id,t,c)) && !(c==='고정지출' && await db.hasCategory(user.id,t,'구독'))) fail('카테고리를 확인해 주세요.');
       (await db.updateTransaction(user.id,row.id,{...await paymentData(user.id,b,t,row),type:t,amount:amount(b.amount),date:ledgerDate(b.date),category:c,memo:typeof b.memo==='string'&&b.memo.length<=500?b.memo:''}));
     }
     return { ok:true };
