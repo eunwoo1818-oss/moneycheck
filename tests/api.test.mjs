@@ -186,3 +186,18 @@ test('현금·카드와 사용자별 카드사를 저장하고 결제수단 변�
   saved=(await request('data','GET',null,admin)).data.transactions.find(t=>t.id===row.id);assert.equal(saved.payment_method,null);assert.equal(saved.card_company,null);
   const legacy=(await request('data','GET',null,admin)).data.transactions.find(t=>t.id==='legacy-fixed');assert.equal(legacy.payment_method,null);
 });
+
+test('아이폰 문자 본문 자동 등록은 재시도·토큰 해제·읽기 권한을 검증한다',async()=>{
+  const key=await request('sms/device','POST',{},admin), token=key.data.token;
+  const send=async message=>{const r=await fetch(base+'/api/sms/iphone',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},body:JSON.stringify({message})});return {status:r.status,data:await r.json()};};
+  const message=`신한카드 ${today().replaceAll('-','.')} 12345 아이폰테스트`;
+  assert.equal((await send(message)).data.recorded,true);
+  assert.equal((await send(message)).data.recorded,false);
+  assert.equal((await send(' '+message+'\r\n')).data.recorded,false);
+  assert.equal((await send('인증번호 123456')).data.recorded,false);
+  const data=(await request('data','GET',null,admin)).data;
+  assert.equal(data.transactions.filter(t=>t.memo==='카드 문자 결제 · 아이폰테스트').length,1);
+  assert.equal(data.monthlyIncome[today().slice(0,7)],30300);
+  assert.equal((await fetch(base+'/api/data',{headers:{Authorization:'Bearer '+token}})).status,401);
+  await request('sms/device','DELETE',{},admin);assert.equal((await send(message)).status,401);
+});

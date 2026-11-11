@@ -5,8 +5,8 @@ import { resolve, extname } from 'node:path';
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
 import { sqlRepository } from './lib/sql-repository.mjs';
 import { defaults } from './lib/categories.mjs';
-import { parseCardSms } from './lib/card-sms.mjs';
-import { monthlyExpenses } from './lib/reports.mjs';
+import { parseCardSms, parseIphoneSms } from './lib/card-sms.mjs';
+import { monthlyExpenses, monthlyIncome } from './lib/reports.mjs';
 import { today, validDate, billDate, nextMonth, occurrences } from './lib/billing.mjs';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
@@ -206,12 +206,12 @@ async function api(req, res, url) {
     if (!await db.consumeReset(hash(b.token),Date.now(),digest(pass))) fail('만료되었거나 이미 사용한 링크입니다.');
     return { ok:true };
   }
-  if (path === '/api/sms/receive' && method === 'POST') {
+  if (['/api/sms/receive','/api/sms/iphone'].includes(path) && method === 'POST') {
     const token = /^Bearer ([a-f0-9]{64})$/.exec(req.headers.authorization || '')?.[1];
     const device = token && await db.smsUser(hash(token),Date.now());
     if (!device) fail('문자 연결이 만료되었거나 해제되었습니다.',401);
     if (await db.rateLimit(hash('sms:'+device.id),Date.now()) > 300) fail('잠시 후 다시 시도해 주세요.',429);
-    const parsed = parseCardSms(await body(req));
+    const parsed = (path==='/api/sms/iphone'?parseIphoneSms:parseCardSms)(await body(req));
     if (!parsed) return {ok:true,recorded:false,message:'지원하지 않는 문자입니다. 직접 확인해 주세요.'};
     const {event,...t} = parsed;
     const result = await db.createTransaction({...t,payment_method:'card',id:'sms-'+hash(device.id+':'+event),user_id:device.id},true);
@@ -253,7 +253,7 @@ async function api(req, res, url) {
     const warnings = await sync(user.id);
     const transactions = await db.transactions(user.id,year);
     const previous = await db.transactions(user.id,String(Number(year)-1));
-    return { user, year, today:today(), warnings, monthlyExpenses:monthlyExpenses([...previous,...transactions]), cardCompanies:await db.cardCompanies(user.id), transactions:transactions.map(t=>({...t,category:t.category==='구독'?'고정지출':t.category})), subscriptions:await Promise.all((await db.subscriptions(user.id)).map(upcoming)), categories:(await db.categories(user.id)).map(c=>({...c,name:c.name==='구독'?'고정지출':c.name})).filter((c,i,a)=>a.findIndex(v=>v.type===c.type&&v.name===c.name)===i) };
+    return { user, year, today:today(), warnings, monthlyIncome:monthlyIncome([...previous,...transactions]), monthlyExpenses:monthlyExpenses([...previous,...transactions]), cardCompanies:await db.cardCompanies(user.id), transactions:transactions.map(t=>({...t,category:t.category==='구독'?'고정지출':t.category})), subscriptions:await Promise.all((await db.subscriptions(user.id)).map(upcoming)), categories:(await db.categories(user.id)).map(c=>({...c,name:c.name==='구독'?'고정지출':c.name})).filter((c,i,a)=>a.findIndex(v=>v.type===c.type&&v.name===c.name)===i) };
   }
   if (path === '/api/card-companies' && method === 'POST') {
     const b=await body(req);await db.addCardCompany(user.id,text(b.name,40));return {ok:true};
